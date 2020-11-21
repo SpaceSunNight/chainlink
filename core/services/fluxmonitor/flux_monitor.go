@@ -563,12 +563,7 @@ func (p *PollingDeviationChecker) consume() {
 	p.readyForLogs()
 	p.setIsHibernatingStatus()
 
-	roundState, err := p.roundState(0)
-	if err != nil {
-		logger.Warnw("Unable to call roundState method on provided contract", "err", err)
-		p.store.UpsertErrorFor(p.JobID(), "Unable to call roundState method on provided contract. Check contract address.")
-	}
-	p.resetTickers(roundState)
+	p.resetTickers(p.initialRoundState())
 	p.performInitialPoll()
 
 	for {
@@ -733,10 +728,12 @@ func (p *PollingDeviationChecker) processLogs() {
 func (p *PollingDeviationChecker) respondToAnswerUpdatedLog(log contracts.LogAnswerUpdated) {
 	logger.Debugw("AnswerUpdated log", p.loggerFieldsForAnswerUpdated(log)...)
 
-	_, err := p.roundState(0)
+	roundState, err := p.roundState(0)
 	if err != nil {
 		logger.Errorw(fmt.Sprintf("could not fetch oracleRoundState: %v", err), p.loggerFieldsForAnswerUpdated(log)...)
+		return
 	}
+	p.resetTickers(roundState)
 }
 
 // The NewRound log tells us that an oracle has initiated a new round.  This tells us that we
@@ -848,6 +845,7 @@ func (p *PollingDeviationChecker) respondToNewRoundLog(log contracts.LogNewRound
 		logger.Errorw(fmt.Sprintf("Ignoring new round request: error fetching eligibility from contract: %v", err), p.loggerFieldsForNewRound(log)...)
 		return
 	}
+	p.resetTickers(roundState)
 	err = p.checkEligibilityAndAggregatorFunding(roundState)
 	if err != nil {
 		logger.Infow(fmt.Sprintf("Ignoring new round request: %v", err), p.loggerFieldsForNewRound(log)...)
@@ -958,6 +956,7 @@ func (p *PollingDeviationChecker) pollIfEligible(thresholds DeviationThresholds)
 		p.store.UpsertErrorFor(p.JobID(), "Unable to call roundState method on provided contract. Check contract address.")
 		return
 	}
+	p.resetTickers(roundState)
 	loggerFields = append(loggerFields, "reportableRound", roundState.ReportableRoundID)
 
 	// If we've just submitted to this round (as the result of a NewRound log, for example) don't submit again
@@ -1034,11 +1033,36 @@ func (p *PollingDeviationChecker) roundState(roundID uint32) (contracts.FluxAggr
 	if err != nil {
 		return contracts.FluxAggregatorRoundState{}, err
 	}
-
-	// Update our tickers to reflect the current on-chain round
-	p.resetTickers(roundState)
-
 	return roundState, nil
+}
+
+// initialRoundState fetches the round information that the fluxmonitor should use when starting
+// new jobs. Choosing the correct round on startup is key to setting timers correctly.
+func (p *PollingDeviationChecker) initialRoundState() contracts.FluxAggregatorRoundState {
+	defaultRoundState := contracts.FluxAggregatorRoundState{
+		StartedAt: uint64(time.Now().Unix()),
+	}
+	latestRoundData, err := p.fluxAggregator.LatestRoundData()
+	if err != nil {
+		logger.Warnf(
+			"unable to retrieve latestRoundData for FluxAggregator contract %s - defaulting "+
+				"to current time for tickers: %v",
+			p.initr.Address.Hex(),
+			err,
+		)
+		return defaultRoundState
+	}
+	latestRoundState, err := p.fluxAggregator.RoundState(p.oracleAddress, latestRoundData.RoundID)
+	if err != nil {
+		logger.Warnf(
+			"unable to call roundState for latest round, contract: %s, round: %d, err: %v",
+			p.initr.Address.Hex(),
+			latestRoundData.RoundID,
+			err,
+		)
+		return defaultRoundState
+	}
+	return latestRoundState
 }
 
 func (p *PollingDeviationChecker) resetTickers(roundState contracts.FluxAggregatorRoundState) {
